@@ -69,7 +69,7 @@ trait Read {
 
     /// Create a splicer to copy data in sections. This mainly exists to allow
     /// creating optimal splicers from `dyn io::Read`s.
-    default fn splicer_to<'a, W: io::Write>(
+    fn splicer_to<'a, W: io::Write>(
         &'a mut self,
         dest: &'a mut W
     ) -> io::Result<Self::Splicer<'a, W>> {
@@ -92,7 +92,7 @@ trait Write {
 
     /// Create a splicer to copy data in sections. This mainly exists to allow
     /// creating optimal splicers from `dyn io::Write`s.
-    default fn splicer_from<'a, R: io::Read>(
+    fn splicer_from<'a, R: io::Read>(
         &'a mut self,
         src: &'a mut R
     ) -> io::Result<Self::Splicer<'a, R>> {
@@ -166,8 +166,17 @@ where
 
 The following methods will be added to `Read` and `Write`:
 
-- `Read::splicer_to` to combine a read and write into a single operation, based on the reader. `Write::splicer_from` mirrors this from the writer, and normally just delegates to the reader's method.
-- `Read::can_efficiently_splice_to` and `Write::can_efficiently_splice_from` allow introspection into whether `Read::splicer_to` and `Write::splicer_from` are optimized, much like how `Read::is_read_vectored` and `Write::is_write_vectored` allow introspection into whether `Read::read_vectored` and `Write::write_vectored` are optimized.
+- `Splicer::splice` to combine a read and write into a single operation, based on the reader. `Write::splicer_from` mirrors this from the writer, and normally just delegates to the reader's method.
+- `Read::can_efficiently_splice_to` and `Write::can_efficiently_splice_from` allow introspection into whether `Read::splicer_to` and `Write::splicer_from` offer an optimized splicer, much like how `Read::is_read_vectored` and `Write::is_write_vectored` allow introspection into whether `Read::read_vectored` and `Write::write_vectored` are optimized.
+
+Additionally, a couple structs will exist to expose what's currently offered for `std::io::copy`:
+
+- `DefaultSplicer` to perform the default read → write loop. Ideally, it should use either a ring buffer or a simple state machine to ensure at most one read and at most one write is attempted each run.
+- `OptimalSplicer` to allow `std::io::splicer` to delegate to whatever's determined to be the most optimal splicer for the given reader and writer.
+  - If the writer's `writer.can_efficiently_splice_from()` returns `true`, prefer the writer's splicer (via `writer.splicer_from(reader)`).
+  - If the writer's `writer.can_efficiently_splice_from()` returns `false`, fall back to the reader's splicer (via `reader.splicer_from(writer)`).
+
+And of course, `std::io::splicer` will be added per above.
 
 ```rust
 trait Splicer<'a, R, W> {
@@ -177,96 +186,37 @@ trait Splicer<'a, R, W> {
     fn writer(&mut self) -> &'a mut W;
 }
 
-pub struct DefaultSplicer<'a, R, W> {
-    reader: &'a mut R,
-    writer: &'a mut W,
-}
+// Implementation elided for brevity.
+pub struct DefaultSplicer<'a, R, W> { ... }
 
 impl<'a, R: io::Read, W: io::Write> Splicer<'a, R, W> for DefaultSplicer<'a, R, W> {
-    fn new<'a>(reader: &'a mut R, writer: &'a mut W) -> io::Result<Self> {
-        Ok(Self { reader, writer })
-    }
-
-    fn splice(&mut self) -> io::Result<usize> {
-        // `DEFAULT_BUF_SIZE` is as currently defined for the `std::io::copy`
-        // implementation.
-        let mut buf = BorrowedBuf::from(&mut [MaybeUninit::uninit(); DEFAULT_BUF_SIZE]);
-
-        reader.read_buf(buf.unfilled())?;
-
-        if !buf.filled().is_empty() {
-            dest.write(buf.filled())?;
-        }
-
-        Ok(buf.filled().len())
-    }
-
-    fn reader(&mut self) -> &'a mut R {
-        self.reader
-    }
-
-    fn writer(&mut self) -> &'a mut W {
-        self.writer
-    }
+    fn new<'a>(reader: &'a mut R, writer: &'a mut W) -> io::Result<Self> { ... }
+    fn splice(&mut self) -> io::Result<usize> { ... }
+    fn reader(&mut self) -> &'a mut R { ... }
+    fn writer(&mut self) -> &'a mut W { ... }
 }
 
-// Hidden as an implementation detail (callees very much shouldn't depend on
-// it), but it's pretty obvious how it'd be implemented.
-enum OptimalSplicerState<'a, R, W> {
-    Read(R::Splicer<'a, W>),
-    Write(W::Splicer<'a, R>),
-}
-
-pub struct OptimalSplicer<'a, R, W> {
-    state: OptimalSplicerState<'a, R, W>,
-}
+// Implementation's pretty obvious, but elided for brevity.
+pub struct OptimalSplicer<'a, R, W> { ... }
 
 impl<'a, R: io::Read, W: io::Write> Splicer<'a, R, W> for OptimalSplicer<'a, R, W> {
-    fn new<'a>(reader: &'a mut R, writer: &'a mut W) -> io::Result<Self> {
-        if writer.can_efficiently_splice_from() {
-            Ok(Self {
-                state: OptimalSplicer::Write(writer.splicer_from(reader, max_bytes)?),
-            })
-        } else {
-            Ok(Self {
-                state: OptimalSplicer::Read(reader.splicer_to(writer, max_bytes)?),
-            })
-        }
-    }
-
-    fn splice(&mut self) -> io::Result<usize> {
-        match &mut self.state {
-            Self::Read(r) => r.splice(),
-            Self::Write(w) => w.splice(),
-        }
-    }
-
-    fn reader(&mut self) -> &'a mut R {
-        match &mut self.state {
-            Self::Read(r) => r.reader(),
-            Self::Write(w) => w.reader(),
-        }
-    }
-
-    fn writer(&mut self) -> &'a mut W {
-        match &mut self.state {
-            Self::Read(r) => r.writer(),
-            Self::Write(w) => w.writer(),
-        }
-    }
+    fn new<'a>(reader: &'a mut R, writer: &'a mut W) -> io::Result<Self> { ... }
+    fn splice(&mut self) -> io::Result<usize> { ... }
+    fn reader(&mut self) -> &'a mut R { ... }
+    fn writer(&mut self) -> &'a mut W { ... }
 }
 
 trait Read {
     type Splicer<'a, W: io::Write>: Splicer<'a, R, Self> = DefaultSplicer<'a, R, Self>;
 
-    default fn splicer_to<'a, W: io::Write>(
+    fn splicer_to<'a, W: io::Write>(
         &'a mut self,
         dest: &'a mut W
     ) -> io::Result<Self::Splicer<'a, W>> {
         Self::Splicer::new(self, dest)
     }
 
-    default fn can_efficiently_splice_to(&self) -> bool {
+    fn can_efficiently_splice_to(&self) -> bool {
         false
     }
 }
@@ -274,7 +224,7 @@ trait Read {
 trait Write {
     type Splicer<'a, R: io::Read>: Splicer<'a, R, Self> = R::Splicer<'a, Self>;
 
-    default fn splicer_from<'a, R: io::Read>(
+    fn splicer_from<'a, R: io::Read>(
         &'a mut self,
         src: &'a mut R
     ) -> io::Result<Self::Splicer<'a, R>> {
@@ -327,139 +277,9 @@ where
 }
 ```
 
-Just for show, here's implementations for each of the relevant methods for `Vec<u8>`, `VecDeque<u8>`, `&[u8]`, and `&mut [u8]`.
+Just for show, here's implementations for each of the relevant types and methods for `VecDeque<u8>`.
 
 ```rust
-struct SpliceFromU8Slice<'a, W> {
-    reader: &'a mut &'a [u8],
-    writer: &'a mut W,
-}
-
-impl<'a, W: io::Write> Splicer<'a, &'a [u8], W> for SpliceFromU8Slice<'a, W> {
-    fn new<'a>(reader: &'a mut &'a [u8], writer: &'a mut W) -> io::Result<Self> {
-        Ok(Self { reader, writer })
-    }
-
-    fn splice(&mut self) -> io::Result<usize> {
-        if self.reader.is_empty() {
-            Ok(0)
-        } else {
-            let len = self.writer.write(self.reader)?;
-            self.reader = &self.reader[len..];
-            Ok(len)
-        }
-    }
-
-    fn reader(&mut self) -> &'a mut &'a [u8] {
-        self.reader
-    }
-
-    fn writer(&mut self) -> &'a mut W {
-        self.writer
-    }
-}
-
-impl io::Read for &[u8] {
-    // ...
-
-    type Splicer<'a, W: io::Write> = SpliceFromU8Slice<'a, W>;
-
-    fn can_efficiently_splice_from(&self) -> bool {
-        true
-    }
-}
-
-struct SpliceToU8Slice<'a, R> {
-    reader: &'a mut R,
-    writer: &'a mut &'a mut [u8],
-}
-
-impl<'a, R: io::Read> Splicer<'a, R, &'a mut [u8]> for SpliceToU8Slice<'a, R> {
-    fn new<'a>(reader: &'a mut R, writer: &'a mut &'a mut [u8]) -> io::Result<Self> {
-        Ok(Self { reader, writer })
-    }
-
-    fn splice(&mut self) -> io::Result<usize> {
-        if self.writer.is_empty() {
-            Ok(0)
-        } else {
-            let len = self.reader.read(self.writer)?;
-            self.writer = std::mem::replace(&mut self.writer, &mut [])[len..];
-            Ok(len)
-        }
-    }
-
-    fn reader(&mut self) -> &'a mut R {
-        self.reader
-    }
-
-    fn writer(&mut self) -> &'a mut &'a mut [u8] {
-        self.writer
-    }
-}
-
-impl io::Write for &mut [u8] {
-    // ...
-
-    type Splicer<'a, R: io::Read> = SpliceToU8Slice<'a, R>;
-
-    fn can_efficiently_splice_from(&self) -> bool {
-        true
-    }
-}
-
-struct SpliceToVec<'a, R> {
-    reader: &'a mut R,
-    writer: &'a mut Vec<u8>,
-}
-
-impl<'a, R: io::Read> Splicer<'a, R, Vec<u8>> for SpliceToVec<'a, R> {
-    fn new<'a>(reader: &'a mut R, writer: &'a mut Vec<u8>) -> io::Result<Self> {
-        Ok(Self { reader, writer })
-    }
-
-    fn splice(&mut self) -> io::Result<usize> {
-        let mut bufs = io::ReadBufs::uninit(&mut [
-            MaybeUninitIoSliceMut::uninit(self.writer.spare_capacity_mut()),
-            MaybeUninitIoSliceMut::uninit(&mut [MaybeUninit::uninit(); DEFAULT_BUF_SIZE]),
-        ]);
-
-        let len = self.reader.read_buf_vectored(&mut bufs)?;
-
-        let (slices, _) = bufs.filled();
-
-        unsafe {
-            if !slices.is_empty() {
-                self.writer.set_len(self.writer.capacity().min(self.writer.len() + len));
-                if let Some(last) = slices.get(1) {
-                    self.writer.reserve(last.len());
-                    self.writer.extend(&last);
-                }
-            }
-        }
-
-        Ok(len)
-    }
-
-    fn reader(&mut self) -> &'a mut R {
-        self.reader
-    }
-
-    fn writer(&mut self) -> &'a mut Vec<u8> {
-        self.writer
-    }
-}
-
-impl io::Write for Vec<u8> {
-    // ...
-
-    type Splicer<'a, R: io::Read> = SpliceToVec<'a, R>;
-
-    fn can_efficiently_splice_from(&self) -> bool {
-        true
-    }
-}
-
 struct SpliceFromVecDeque<'a, W> {
     reader: &'a mut VecDeque<u8>,
     writer: &'a mut W,
